@@ -36,12 +36,6 @@ sudo apt -y install \
   fonts-dejavu \
   zlib1g-dev
 ```
-And install `image` and `pillow` from PIP:
-```
-sudo pip3 install \
-  image \
-  pillow
-```
 
 ### Get the Code
 Clone from GitHub:
