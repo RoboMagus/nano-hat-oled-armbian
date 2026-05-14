@@ -22,13 +22,27 @@ THE SOFTWARE.
 """
 
 from PIL import Image, ImageDraw, ImageFont
+import logging
 import os
+import re
+import signal
 import smbus
 import subprocess
+import sys
 import time
 import gpiod
 
 from datetime import timedelta
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] L%(lineno)d: %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
 
 DISPLAY_OFF_TIMEOUT = 30
 
@@ -42,11 +56,50 @@ image_draw = ImageDraw.Draw(image)
 image_font8 = ImageFont.truetype("DejaVuSansMono.ttf", 8)
 image_font10 = ImageFont.truetype("DejaVuSansMono.ttf", 10)
 image_font15 = ImageFont.truetype("DejaVuSansMono.ttf", 15)
+image_font20 = ImageFont.truetype("DejaVuSansMono.ttf", 20)
 image_font25 = ImageFont.truetype("DejaVuSansMono.ttf", 25)
 key1_cmd_index = 1
 key2_cmd_index = 2
 key3_cmd_index = 3
-shutdown_time = 0
+
+class SignalException(Exception):
+    pass
+
+def handle_signal(sig, frame):
+    logger.info(f"handle_signal({sig}, {frame}")
+    try:
+        sysctl_jobs = subprocess.check_output(
+            "systemctl list-jobs",
+            shell=True,
+            text=True,
+        )
+        logger.debug("sysctl jobs: %s", sysctl_jobs)
+
+        _text = ""
+        if re.search("shutdown.target.*start", sysctl_jobs):
+            _text = "Shutdown"
+        if re.search("reboot.target.*start", sysctl_jobs):
+            _text = "Rebooting"
+
+        if _text == "":
+            i2c0_bus.write_i2c_block_data(0x3C, 0x00, [0xAE]) # Display off
+        else:
+            image_draw.rectangle((0, 0, 128, 64), 0)
+            image_draw.text((6, 24), _text, 1, image_font20)
+            write_i2c_image_data(i2c0_bus, image)
+            i2c0_bus.write_i2c_block_data(0x3C, 0x00, [0xAF])  # set display on
+            logger.info("OLed print: %s", _text)
+            if _text == "Shutdown":
+                time.sleep(2)
+                i2c0_bus.write_i2c_block_data(0x3C, 0x00, [0xAE]) # Display off
+
+    except Exception as e:
+        logger.critical(e, exc_info=True)
+
+    raise SignalException(f"Signal: {sig}, Frame: {frame}")
+
+signal.signal(signal.SIGUSR1, handle_signal)
+signal.signal(signal.SIGTERM, handle_signal)
 
 
 def write_i2c_image_data(i2c_bus, image):
@@ -114,7 +167,6 @@ try:
                 0xA6,  # set display normal (not inverse)
                 0x20,
                 0x00,  # set horizontal addressing mode
-                0xAF,  # set display on
             ],
         )
 
@@ -128,10 +180,13 @@ try:
                         offset = event.line_offset
                         if offset == 0:
                             cmd_index = key1_cmd_index
+                            logger.info("Key 1")
                         elif offset == 2:
                             cmd_index = key2_cmd_index
+                            logger.info("Key 2")
                         elif offset == 3:
                             cmd_index = key3_cmd_index
+                            logger.info("Key 3")
 
                         display_refresh_time = 0
                         display_off_time = current_time + DISPLAY_OFF_TIMEOUT
@@ -147,18 +202,14 @@ try:
                     display_on = False
                 continue
             elif current_time > display_refresh_time:
-                if not display_on:
-                    i2c0_bus.write_i2c_block_data(0x3C, 0x00, [0xAF])  # set display on
-                    display_on = True
-
                 if cmd_index == 0:
                     key1_cmd_index = 1
                     key2_cmd_index = 2
                     key3_cmd_index = 3
-                    splash = Image.open("splash.png")
-                    image.paste(splash)
-                    write_i2c_image_data(i2c0_bus, image)
-                    splash.close()
+                    with Image.open("splash.png") as splash:
+                        image.paste(splash)
+                        write_i2c_image_data(i2c0_bus, image)
+                    logger.info("Show splash")
                     display_refresh_time = current_time + DISPLAY_OFF_TIMEOUT
                 elif cmd_index == 1:
                     key1_cmd_index = 0
@@ -231,16 +282,18 @@ try:
                     display_refresh_time = current_time + 5
                     write_i2c_image_data(i2c0_bus, image)
                 elif cmd_index == 99:  # break and shutdown cmd_index 99
-                    break
+                    os.system("shutdown now")
+
+                if not display_on:
+                    i2c0_bus.write_i2c_block_data(0x3C, 0x00, [0xAF])  # set display on
+                    display_on = True
+
 
 except KeyboardInterrupt:
-    print(" CTRL+C detected")
+    logger.info(" CTRL+C detected")
+except SignalException:
+    logger.info(" Termination signal")
 except Exception as error:
-    print(error)
-
+    logger.error(error)
 finally:
-    i2c0_bus.write_i2c_block_data(0x3C, 0x00, [0xAE])  # set display off
-    if cmd_index == 99:  # shutdown now if the command index was 99
-        os.system("shutdown now")
-    else:
-        exit(0)
+    logger.info("FIN")
